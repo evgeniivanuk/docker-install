@@ -57,30 +57,32 @@ trap cleanup EXIT
 get_ubuntu_codename() {
     local codename=""
     
-    # Try multiple methods to get codename
+    # Method 1: Use lsb_release -cs
     if command -v lsb_release &> /dev/null; then
-        codename=$(lsb_release -cs 2>/dev/null)
+        codename=$(lsb_release -cs 2>/dev/null | tr -d '[:space:]')
     fi
     
-    # Fallback to /etc/os-release
+    # Method 2: Parse /etc/os-release directly if lsb_release fails
     if [[ -z "$codename" ]] && [[ -f /etc/os-release ]]; then
-        source /etc/os-release
-        codename="${UBUNTU_CODENAME:-$VERSION_CODENAME}"
+        # Extract VERSION_CODENAME or UBUNTU_CODENAME
+        codename=$(grep -E '^(UBUNTU_CODENAME|VERSION_CODENAME)=' /etc/os-release | head -n1 | cut -d'=' -f2 | tr -d '"' | tr -d '[:space:]')
     fi
     
-    # Manual mapping for common versions if still empty
-    if [[ -z "$codename" ]]; then
-        local version=$(lsb_release -rs 2>/dev/null || echo "")
-        case "$version" in
+    # Method 3: Manual mapping based on VERSION_ID
+    if [[ -z "$codename" ]] && [[ -f /etc/os-release ]]; then
+        local version_id=$(grep '^VERSION_ID=' /etc/os-release | cut -d'=' -f2 | tr -d '"')
+        case "$version_id" in
             "24.04") codename="noble" ;;
             "22.04") codename="jammy" ;;
             "20.04") codename="focal" ;;
             "18.04") codename="bionic" ;;
-            *) 
-                log_error "Не удалось определить кодовое имя Ubuntu для версии: $version"
-                exit 1
-                ;;
         esac
+    fi
+    
+    # Validate and return
+    if [[ -z "$codename" ]]; then
+        log_error "Не удалось определить кодовое имя Ubuntu"
+        exit 1
     fi
     
     echo "$codename"
@@ -99,12 +101,12 @@ check_privileges() {
 # Check Ubuntu version and codename
 check_ubuntu_version() {
     if ! command -v lsb_release &> /dev/null; then
-        log_error "lsb_release не найден. Устанавливаем lsb-release..."
+        log_info "lsb_release не найден. Устанавливаем lsb-release..."
         sudo apt-get update && sudo apt-get install -y lsb-release
     fi
     
-    local distro=$(lsb_release -si)
-    local version=$(lsb_release -sr)
+    local distro=$(lsb_release -si 2>/dev/null || echo "Unknown")
+    local version=$(lsb_release -sr 2>/dev/null || echo "Unknown")
     
     if [[ "$distro" != "Ubuntu" ]]; then
         log_error "Этот скрипт предназначен для Ubuntu, обнаружена система: $distro"
@@ -114,11 +116,8 @@ check_ubuntu_version() {
     local codename=$(get_ubuntu_codename)
     log_info "Обнаружена система: $distro $version ($codename)"
     
-    # Validate codename
-    if [[ -z "$codename" ]]; then
-        log_error "Не удалось определить кодовое имя Ubuntu"
-        exit 1
-    fi
+    # Store codename globally for later use
+    export UBUNTU_CODENAME="$codename"
 }
 
 # Check if Docker is already installed
@@ -159,7 +158,12 @@ retry() {
 # Remove old Docker packages
 remove_old_docker() {
     log_info "Удаляем старые версии Docker..."
-    sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+    for pkg in docker docker-engine docker.io containerd runc; do
+        if dpkg -l | grep -q "^ii  $pkg "; then
+            log_info "Удаляем пакет: $pkg"
+            sudo apt-get remove -y "$pkg" 2>/dev/null || true
+        fi
+    done
 }
 
 # Main installation function
@@ -186,15 +190,22 @@ install_docker() {
     retry 3 5 sudo curl -fsSL "$DOCKER_GPG_URL" -o /etc/apt/keyrings/docker.asc
     sudo chmod a+r /etc/apt/keyrings/docker.asc
     
-    # Get Ubuntu codename
-    local codename=$(get_ubuntu_codename)
-    log_info "Используем кодовое имя Ubuntu: $codename"
-    
-    # Add Docker repository
-    log_info "Добавляем репозиторий Docker..."
+    # Get architecture and Ubuntu codename
     local arch=$(dpkg --print-architecture)
-    echo "deb [arch=$arch signed-by=/etc/apt/keyrings/docker.asc] $DOCKER_APT_REPO $codename stable" | \
-        sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    local codename="$UBUNTU_CODENAME"
+    
+    log_info "Архитектура: $arch"
+    log_info "Кодовое имя Ubuntu: $codename"
+    
+    # Add Docker repository with explicit codename (no variable substitution)
+    log_info "Добавляем репозиторий Docker..."
+    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null <<EOF
+deb [arch=$arch signed-by=/etc/apt/keyrings/docker.asc] $DOCKER_APT_REPO $codename stable
+EOF
+    
+    # Verify repository file content
+    log_info "Содержимое файла репозитория:"
+    cat /etc/apt/sources.list.d/docker.list | log_info "$(cat)"
     
     # Update package list with Docker repository
     log_info "Обновляем список пакетов с репозиторием Docker..."
