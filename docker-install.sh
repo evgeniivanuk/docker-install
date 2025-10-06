@@ -3,7 +3,7 @@
 # Docker Installation Script for Ubuntu
 # This script installs Docker CE on Ubuntu systems
 
-set -euo pipefail  # Enable strict mode for error handling
+set -euo pipefail
 IFS=$'\n\t'
 
 # Global variables
@@ -16,9 +16,9 @@ DOCKER_APT_REPO="https://download.docker.com/linux/ubuntu"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Logging function
+# Logging functions
 log() {
     local level="$1"
     local message="$2"
@@ -26,19 +26,16 @@ log() {
     echo -e "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
 }
 
-# Info logging with color
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
     log "INFO" "$1"
 }
 
-# Warning logging with color
 log_warn() {
     echo -e "${YELLOW}[WARN]${NC} $1"
     log "WARN" "$1"
 }
 
-# Error logging with color
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1" >&2
     log "ERROR" "$1"
@@ -54,8 +51,40 @@ cleanup() {
     exit $exit_code
 }
 
-# Set trap for cleanup
 trap cleanup EXIT
+
+# Get Ubuntu codename reliably
+get_ubuntu_codename() {
+    local codename=""
+    
+    # Try multiple methods to get codename
+    if command -v lsb_release &> /dev/null; then
+        codename=$(lsb_release -cs 2>/dev/null)
+    fi
+    
+    # Fallback to /etc/os-release
+    if [[ -z "$codename" ]] && [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        codename="${UBUNTU_CODENAME:-$VERSION_CODENAME}"
+    fi
+    
+    # Manual mapping for common versions if still empty
+    if [[ -z "$codename" ]]; then
+        local version=$(lsb_release -rs 2>/dev/null || echo "")
+        case "$version" in
+            "24.04") codename="noble" ;;
+            "22.04") codename="jammy" ;;
+            "20.04") codename="focal" ;;
+            "18.04") codename="bionic" ;;
+            *) 
+                log_error "Не удалось определить кодовое имя Ubuntu для версии: $version"
+                exit 1
+                ;;
+        esac
+    fi
+    
+    echo "$codename"
+}
 
 # Check if script is run as root or with sudo
 check_privileges() {
@@ -67,20 +96,29 @@ check_privileges() {
     fi
 }
 
-# Check Ubuntu version
+# Check Ubuntu version and codename
 check_ubuntu_version() {
     if ! command -v lsb_release &> /dev/null; then
-        log_error "lsb_release не найден. Убедитесь, что это система Ubuntu"
-        exit 1
+        log_error "lsb_release не найден. Устанавливаем lsb-release..."
+        sudo apt-get update && sudo apt-get install -y lsb-release
     fi
     
     local distro=$(lsb_release -si)
+    local version=$(lsb_release -sr)
+    
     if [[ "$distro" != "Ubuntu" ]]; then
         log_error "Этот скрипт предназначен для Ubuntu, обнаружена система: $distro"
         exit 1
     fi
     
-    log_info "Обнаружена система: $distro $(lsb_release -sr)"
+    local codename=$(get_ubuntu_codename)
+    log_info "Обнаружена система: $distro $version ($codename)"
+    
+    # Validate codename
+    if [[ -z "$codename" ]]; then
+        log_error "Не удалось определить кодовое имя Ubuntu"
+        exit 1
+    fi
 }
 
 # Check if Docker is already installed
@@ -118,9 +156,18 @@ retry() {
     return 0
 }
 
+# Remove old Docker packages
+remove_old_docker() {
+    log_info "Удаляем старые версии Docker..."
+    sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+}
+
 # Main installation function
 install_docker() {
     log_info "Начинаем установку Docker..."
+    
+    # Remove old Docker packages
+    remove_old_docker
     
     # Update package list
     log_info "Обновляем список пакетов..."
@@ -128,7 +175,7 @@ install_docker() {
     
     # Install prerequisites
     log_info "Устанавливаем необходимые пакеты..."
-    sudo apt-get install -y ca-certificates curl
+    sudo apt-get install -y ca-certificates curl gnupg lsb-release
     
     # Create directory for keyrings
     log_info "Создаём директорию для ключей..."
@@ -139,13 +186,16 @@ install_docker() {
     retry 3 5 sudo curl -fsSL "$DOCKER_GPG_URL" -o /etc/apt/keyrings/docker.asc
     sudo chmod a+r /etc/apt/keyrings/docker.asc
     
-   # Add Docker repository
+    # Get Ubuntu codename
+    local codename=$(get_ubuntu_codename)
+    log_info "Используем кодовое имя Ubuntu: $codename"
+    
+    # Add Docker repository
     log_info "Добавляем репозиторий Docker..."
-    echo \
-        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] $DOCKER_APT_REPO \
-        $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
+    local arch=$(dpkg --print-architecture)
+    echo "deb [arch=$arch signed-by=/etc/apt/keyrings/docker.asc] $DOCKER_APT_REPO $codename stable" | \
         sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-        
+    
     # Update package list with Docker repository
     log_info "Обновляем список пакетов с репозиторием Docker..."
     retry 3 5 sudo apt-get update
@@ -179,12 +229,13 @@ verify_installation() {
     local docker_version=$(docker --version)
     log_info "Установленная версия Docker: $docker_version"
     
-    if command -v docker-compose &> /dev/null; then
+    if command -v docker &> /dev/null && docker compose version &> /dev/null; then
         local compose_version=$(docker compose version)
         log_info "Установленная версия Docker Compose: $compose_version"
     fi
     
     # Test Docker daemon
+    log_info "Тестируем работу Docker..."
     if sudo docker run --rm hello-world &> /dev/null; then
         log_info "Docker работает корректно"
     else
